@@ -1,0 +1,10 @@
+mint mint,seq_num:0 pkey http://tokenurl.com
+print_nfts
+list list,buyer:any,nft_id:10000,price:10,seq_num:1 pkey 10000 10 any
+print_listings
+update_balance 0xF2862Cc64AdCf0A6fb9470ef8Fbf60D6234c2E0c 1000
+buy buy,nft_id:10000,price:10,seq_num:0 10000 pkey
+print_wallets
+print_listings
+print_nfts
+q

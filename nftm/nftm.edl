@@ -1,0 +1,62 @@
+// Copyright (c) Open Enclave SDK contributors.
+// Licensed under the MIT License.
+
+enclave {
+    from "openenclave/edl/syscall.edl" import *;
+    from "platform.edl" import *;
+
+  //  struct nft_data_t    {
+  //      char* address;
+  //      uint32_t nft_id;
+  //  };
+
+    trusted {
+        // data separted by commas. ex: addr1:id1,addr2:id2
+        public void enclave_update_nft_status([in, size = data_size] const char* data, size_t data_size, 
+        [in, size = sig_size] const char* signature, size_t sig_size);
+
+        public void enclave_update_wallet_balances([in, size = sig_size] const char* signature, size_t sig_size, 
+        [in, size = address_size] const char* address, size_t address_size, int balance, unsigned seq_num);
+
+        // mint nft. Takes users signature and nft token URI
+        public void enclave_mint_nft([in, size = token_uri_size] const char* token_uri, size_t token_uri_size, 
+        [in, size = sig_size] const char* signature, size_t sig_size, 
+        [in, size = address_size] const char* address, size_t address_size);
+
+        // list nft. Takes the nft id
+        public void enclave_list_nft( [in, size = sig_size] const char* signature, size_t sig_size, 
+            [in, size = address_size] const char* address, size_t address_size, int nft_id, unsigned price, 
+            [in, size = buyer_address_size] const char* buyer_address, size_t buyer_address_size);
+
+        // buy NFT
+        public void enclave_buy_nft([in, size = sig_size] const char* signature, size_t sig_size,
+            [in, size = address_size] const char* address, size_t address_size, int nft_id);
+
+        // update transaction status
+        public void enclave_update_transaction_status([in, size = sig_size] const char* signature, size_t sig_size,
+            [in, size = tee_signature_size] const char* tee_signature, size_t tee_signature_size, int nft_id, 
+            [in, size = status_size] const char* status, size_t status_size);
+
+        // prints current ownership status
+        public void print_nft_owership_data();
+
+        // prints proxy wallet balances
+        public void print_proxy_wallet_balances();
+
+        // prints teh current NFT listings
+        public void print_listings();
+
+        // print pending final sections
+        public void print_pending();
+    };
+
+    untrusted {
+        void host_propogate([in, size = sig_size] const char* signature, size_t sig_size, 
+        [in, size = message_size] const char* message, size_t message_size);
+
+        void host_propogate_buy([in, size = sig_size] const char* signature, size_t sig_size, 
+        [in, size = message_size] const char* message, size_t message_size);
+    };
+};
+
+

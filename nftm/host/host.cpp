@@ -1,0 +1,742 @@
+// Copyright (c) Open Enclave SDK contributors.
+// Licensed under the MIT License.
+
+#include <openenclave/host.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <openssl/err.h>
+#include <stdio.h>
+#include <iostream>
+#include <string>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <memory>  
+#include <vector>
+#include <cstring>
+#include <sys/random.h>
+#include <sstream>
+#include <sys/time.h>
+
+#include <secp256k1_recovery.h>
+
+#include "nftm_u.h"
+
+
+
+using std::uint8_t;
+using std::uint64_t;
+using std::size_t;
+using std::vector;
+
+typedef vector<std::uint8_t> Bytes;
+
+#define SHA3_256_DIGEST_LENGTH 32
+
+std::string verifier_private_key = "----------";
+std::string verifier_addr = "0x9a932e12B60cE08b891710e100Ed80bb0b2E63ba";
+
+// bool check_simulate_opt(int* argc, const char* argv[])
+// {
+//     for (int i = 0; i < *argc; i++)
+//     {
+//         if (strcmp(argv[i], "--simulate") == 0)
+//         {
+//             fprintf(stdout, "Running in simulation mode\n");
+//             memmove(&argv[i], &argv[i + 1], (*argc - i) * sizeof(char*));
+//             (*argc)--;
+//             return true;
+//         }
+//     }
+//     return false;
+// }
+
+
+static int fill_random(unsigned char* data, size_t size) {
+    ssize_t res = getrandom(data, size, 0);
+    if (res < 0 || (size_t)res != size ) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+static void print_hex(unsigned char* data, size_t size) {
+    size_t i;
+    printf("0x");
+    for (i = 0; i < size; i++) {
+        printf("%02x", data[i]);
+    }
+    printf("\n");
+}
+
+static std::string get_string_hex(unsigned char* data, size_t size) {
+
+    char converted[size*2 + 1];
+    for(size_t i = 0; i < size; i++) {
+        sprintf(&converted[i*2], "%02x", data[i]);
+    }
+    std::string result = &converted[0];
+
+    return result;
+}
+
+Bytes asciiBytes(const char *str) {
+	return Bytes(str, str + std::strlen(str));
+}
+
+Bytes hexBytes(const char *str) {
+	Bytes result;
+	size_t length = std::strlen(str);
+	assert(length % 2 == 0);
+	for (size_t i = 0; i < length; i += 2) {
+		unsigned int temp;
+		std::sscanf(&str[i], "%02x", &temp);
+		result.push_back(static_cast<std::uint8_t>(temp));
+	}
+	return result;
+}
+
+class Keccak256 final {
+	
+	public: static constexpr int HASH_LEN = 32;
+	private: static constexpr int BLOCK_SIZE = 200 - HASH_LEN * 2;
+	private: static constexpr int NUM_ROUNDS = 24;
+	
+	
+    public: static void getHashHelper(std::string message, std::uint8_t hashResult[HASH_LEN]);
+
+    public: static void getHash(const std::uint8_t msg[], std::size_t len, std::uint8_t hashResult[HASH_LEN]);
+	
+	private: static void absorb(std::uint64_t state[5][5]);
+	
+	
+	// Requires 0 <= i <= 63
+	private: static std::uint64_t rotl64(std::uint64_t x, int i);
+	
+	
+	Keccak256() = delete;  // Not instantiable
+	
+	
+	private: static const unsigned char ROTATION[5][5];
+	
+};
+
+
+void Keccak256::getHashHelper(std::string message, std::uint8_t hashResult[HASH_LEN]) {
+
+    Bytes message_prefix = asciiBytes("\x19""Ethereum Signed Message:\n");
+    Bytes sample_data = asciiBytes(message.c_str());
+    Bytes sample_data_size = asciiBytes(std::to_string(message.size()).c_str());
+    message_prefix.insert(message_prefix.end(), sample_data_size.begin(), sample_data_size.end());
+    message_prefix.insert(message_prefix.end(), sample_data.begin(), sample_data.end());
+
+    Keccak256::getHash(message_prefix.data(), message_prefix.size(), hashResult);
+}
+
+void Keccak256::getHash(const uint8_t msg[], size_t len, uint8_t hashResult[HASH_LEN]) {
+	assert((msg != nullptr || len == 0) && hashResult != nullptr);
+	uint64_t state[5][5] = {};
+	
+	// XOR each message byte into the state, and absorb full blocks
+	int blockOff = 0;
+	for (size_t i = 0; i < len; i++) {
+		int j = blockOff >> 3;
+		state[j % 5][j / 5] ^= static_cast<uint64_t>(msg[i]) << ((blockOff & 7) << 3);
+		blockOff++;
+		if (blockOff == BLOCK_SIZE) {
+			absorb(state);
+			blockOff = 0;
+		}
+	}
+	
+	// Final block and padding
+	{
+		int i = blockOff >> 3;
+		state[i % 5][i / 5] ^= UINT64_C(0x01) << ((blockOff & 7) << 3);
+		blockOff = BLOCK_SIZE - 1;
+		int j = blockOff >> 3;
+		state[j % 5][j / 5] ^= UINT64_C(0x80) << ((blockOff & 7) << 3);
+		absorb(state);
+	}
+	
+	// Uint64 array to bytes in little endian
+	for (int i = 0; i < HASH_LEN; i++) {
+		int j = i >> 3;
+		hashResult[i] = static_cast<uint8_t>(state[j % 5][j / 5] >> ((i & 7) << 3));
+	}
+}
+
+
+void Keccak256::absorb(uint64_t state[5][5]) {
+	uint64_t (*a)[5] = state;
+	uint8_t r = 1;  // LFSR
+	for (int i = 0; i < NUM_ROUNDS; i++) {
+		// Theta step
+		uint64_t c[5] = {};
+		for (int x = 0; x < 5; x++) {
+			for (int y = 0; y < 5; y++)
+				c[x] ^= a[x][y];
+		}
+		for (int x = 0; x < 5; x++) {
+			uint64_t d = c[(x + 4) % 5] ^ rotl64(c[(x + 1) % 5], 1);
+			for (int y = 0; y < 5; y++)
+				a[x][y] ^= d;
+		}
+		
+		// Rho and pi steps
+		uint64_t b[5][5];
+		for (int x = 0; x < 5; x++) {
+			for (int y = 0; y < 5; y++)
+				b[y][(x * 2 + y * 3) % 5] = rotl64(a[x][y], ROTATION[x][y]);
+		}
+		
+		// Chi step
+		for (int x = 0; x < 5; x++) {
+			for (int y = 0; y < 5; y++)
+				a[x][y] = b[x][y] ^ (~b[(x + 1) % 5][y] & b[(x + 2) % 5][y]);
+		}
+		
+		// Iota step
+		for (int j = 0; j < 7; j++) {
+			a[0][0] ^= static_cast<uint64_t>(r & 1) << ((1 << j) - 1);
+			r = static_cast<uint8_t>((r << 1) ^ ((r >> 7) * 0x171));
+		}
+	}
+}
+
+
+uint64_t Keccak256::rotl64(uint64_t x, int i) {
+	return ((0U + x) << i) | (x >> ((64 - i) & 63));
+}
+
+
+// Static initializers
+const unsigned char Keccak256::ROTATION[5][5] = {
+	{ 0, 36,  3, 41, 18},
+	{ 1, 44, 10, 45,  2},
+	{62,  6, 43, 15, 61},
+	{28, 55, 25, 21, 56},
+	{27, 20, 39,  8, 14},
+};
+
+
+// std::string get_keccakk_256_signature(const std::string data, const std::string key) {
+
+
+//     std::cout << "Here 0\n";
+
+//     // Initialize Keccak-256 context
+//     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+//     if (!ctx) {
+//         printf("Failed to create Keccak-256 context\n");
+//         throw std::runtime_error("Failed to create Keccak-256 context");
+//     }
+
+//     std::cout << "Here 1\n";
+
+//     int ret = EVP_DigestSignInit(ctx, nullptr, EVP_sha3_256(), nullptr, (EVP_PKEY*) key.data());
+//     if (ret != 1) {
+//         ERR_print_errors_fp(stderr);
+//         throw std::runtime_error("Failed to initialize Keccak-256 context");
+//     }
+
+//     std::cout << "Here 2\n";
+
+//     // Update context with data to be signed
+//     ret = EVP_DigestSignUpdate(ctx, data.data(), data.size());
+//     if (ret != 1) {
+//         throw std::runtime_error("Failed to update Keccak-256 context with data");
+//     }
+
+//     // Generate signature
+//     size_t sig_len = 0;
+//     ret = EVP_DigestSignFinal(ctx, nullptr, &sig_len);
+//     if (ret != 1) {
+//         throw std::runtime_error("Failed to get Keccak-256 signature length");
+//     }
+
+//     std::unique_ptr<unsigned char[]> sig(new unsigned char[sig_len]);
+//     ret = EVP_DigestSignFinal(ctx, sig.get(), &sig_len);
+//     if (ret != 1) {
+//         throw std::runtime_error("Failed to generate Keccak-256 signature");
+//     }
+
+//     EVP_MD_CTX_free(ctx);
+
+//     return std::string(sig.get(), sig.get() + sig_len);
+
+// }
+
+
+std::string get_secp256k1_signature(const std::string message, const std::string key, std::string &address) {
+    std::uint8_t message_hash[Keccak256::HASH_LEN];
+    Keccak256::getHashHelper(message, message_hash);
+
+
+    //printf("\n The hash of the message %s is :", message.c_str());
+    // for (int i = 0; i < Keccak256::HASH_LEN; i++) {
+    //             printf("%02x", message_hash[i]);
+    // }
+
+    //printf("\n\n");
+
+    secp256k1_ecdsa_recoverable_signature sig;
+    /* Before we can call actual API functions, we need to create a "context". */
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    unsigned char randomize[32];
+
+    if (!fill_random(randomize, sizeof(randomize))) {
+        printf("Failed to generate randomness\n");
+        return "Failed";
+    }
+    /* Randomizing the context is recommended to protect against side-channel
+     * leakage See `secp256k1_context_randomize` in secp256k1.h for more
+     * information about it. This should never fail. */
+    int return_val = secp256k1_context_randomize(ctx, randomize);
+    assert(return_val);
+
+    Bytes key_bytes = hexBytes(key.data());
+
+    unsigned char key_arr[32];
+
+    std::copy(key_bytes.begin(), key_bytes.end(), key_arr);
+
+
+    /*** Signing ***/
+
+    /* Generate an ECDSA signature `noncefp` and `ndata` allows you to pass a
+     * custom nonce function, passing `NULL` will use the RFC-6979 safe default.
+     * Signing with a valid context, verified secret key
+     * and the default nonce function should never fail. */
+    return_val = secp256k1_ecdsa_sign_recoverable(ctx, &sig, message_hash, key_arr, NULL, NULL);
+    assert(return_val);
+
+    /* Serialize the signature in a compact form. Should always return 1
+     * according to the documentation in secp256k1.h. */
+
+    unsigned char serialized_signature[64];
+
+    int rec_id;
+    return_val = secp256k1_ecdsa_recoverable_signature_serialize_compact(ctx, serialized_signature, &rec_id, &sig);
+    assert(return_val);
+
+    /*** Verification ***/
+
+    /* Deserialize the signature. This will return 0 if the signature can't be parsed correctly. */
+    if (!secp256k1_ecdsa_recoverable_signature_parse_compact(ctx, &sig, serialized_signature, rec_id)) {
+        printf("Failed parsing the signature\n");
+        return "Failed to parse the signature";
+    }
+
+    secp256k1_pubkey pubkey;
+
+    if (!secp256k1_ecdsa_recover(ctx, &pubkey, &sig, message_hash)) {
+	printf("Failed to recover the public key !!!!");
+    	return "Failed to recover public key";
+    }
+
+
+    unsigned char uncompressed_pubkey[65];
+
+    size_t len = sizeof(uncompressed_pubkey);
+    return_val = secp256k1_ec_pubkey_serialize(ctx, uncompressed_pubkey, &len, &pubkey, SECP256K1_EC_UNCOMPRESSED);
+    assert(return_val);
+
+    // print_hex(key_arr, sizeof(key_arr));
+    // printf("Public Key: ");
+    // print_hex(uncompressed_pubkey, sizeof(uncompressed_pubkey));
+    // printf("Signature: ");
+    // print_hex(serialized_signature, sizeof(serialized_signature));
+    // printf("RecoveryID: ");
+    // printf("%d\n", rec_id);
+
+    /* This will clear everything from the context and free the memory */
+    secp256k1_context_destroy(ctx);
+
+    // Get the user address from the public key
+    //1. remove the first byte from the public key
+    unsigned char uncompressed_pubkey_new[64];
+
+    for (int i = 0; i < 64; i++) {
+        uncompressed_pubkey_new[i] = uncompressed_pubkey[i+1];
+    }
+
+    // 2. Keccak-256 this slice
+    std::uint8_t keyHash[Keccak256::HASH_LEN];
+
+    Keccak256::getHash(uncompressed_pubkey_new, 64, keyHash);
+
+    //3. Get the last 20 bytes from the hash
+    std::uint8_t address_bytes[20];
+    for (int i = 0; i < 20; i++) {
+        address_bytes[i] = keyHash[i+12];
+    }
+
+    // printf("Recovered address is : ");
+    // print_hex(address_bytes, sizeof(address_bytes));
+
+    address = "0x" + get_string_hex(address_bytes, sizeof(address));
+    address.resize(42);
+
+    // Full Signature
+    // append with 27 + recovery_id
+
+    std::stringstream sstream;
+    sstream << std::hex << rec_id + 27;
+    std::string lastbyte = sstream.str();
+
+    std::string partial_signature = get_string_hex(&serialized_signature[0], sizeof(serialized_signature));
+    std::string full_signature = "0x" + partial_signature + lastbyte;
+
+    return full_signature;
+}
+
+void host_propogate(const char* signature, size_t sig_size, const char* message, size_t message_size) 
+{
+    std::string sig(signature, sig_size);
+    std::string msg(message, message_size);
+    std::cout<< "Message from enclave : " << msg << "\t Signature: " << sig<< std::endl;
+}
+
+void host_propogate_buy(const char* signature, size_t sig_size, const char* message, size_t message_size) 
+{
+    std::string sig(signature, sig_size);
+    std::string msg(message, message_size);
+    std::cout<< "Message from enclave : " << msg << "\t Signature: " << sig<< std::endl;
+
+    // CALL the smart contract
+}
+
+unsigned int verifier_seq_num = 0;
+
+int main(int argc, const char* argv[])
+{
+
+    if (__cplusplus == 201703L) std::cout << "C++17\n";
+    else if (__cplusplus == 201402L) std::cout << "C++14\n";
+    else if (__cplusplus == 201103L) std::cout << "C++11\n";
+    else if (__cplusplus == 199711L) std::cout << "C++98\n";
+    else std::cout << "pre-standard C++\n";
+
+    oe_result_t result;
+    int ret = 1;
+    oe_enclave_t* enclave = NULL;
+
+    uint32_t flags = OE_ENCLAVE_FLAG_DEBUG;
+
+    // Create the enclave
+     printf("Host: Creating the enclave\n");
+
+    result = oe_create_nftm_enclave(
+        argv[1], OE_ENCLAVE_TYPE_AUTO, flags, NULL, 0, &enclave);
+    if (result != OE_OK)
+    {
+        printf(
+            "Host: oe_create_nftm_enclave failed. %s",
+            oe_result_str(result));
+            goto exit;
+    }
+    else
+    {
+        printf("Host: Enclave successfully created.\n");
+    }
+
+#ifdef __linux__
+    // verify if SGX_AESM_ADDR is successfully set
+    if (getenv("SGX_AESM_ADDR"))
+    {
+        printf("Host: environment variable SGX_AESM_ADDR is set\n");
+    }
+    else
+    {
+        printf("Host: environment variable SGX_AESM_ADDR is not set\n");
+    }
+#endif //__linux__
+
+
+    while (true) {
+
+        std::string command;
+        std::cin >> command;
+
+        if (command == "q") {
+            break;
+        }
+
+        // generate digest
+        if (command == "gd") {
+            std::string message;
+            // std::cout<<"Please enter the message\n";
+            std::cin >> message;
+
+            std::uint8_t actualHash[Keccak256::HASH_LEN];
+            Keccak256::getHashHelper(message, actualHash);
+
+            printf("Digest is : ");
+            for (int i = 0; i < Keccak256::HASH_LEN; i++) {
+                printf("%02x", actualHash[i]);
+            }
+
+            printf("\n\n");
+            
+        }
+
+        // generate signature and recover public key
+
+        if (command == "gs") {
+            std::string message;
+            //std::cout << "Please enter the message to sign\n";
+            std::cin >> message;
+
+            std::string key;
+            //std::cout << "Please enter the private key\n";
+            std::cin >> key;
+
+            std::string address;
+
+            std::string signature = get_secp256k1_signature(message, key, address);
+
+            printf("Signature is : %s\n", signature.c_str());
+            printf("Recoved Address: %s, size = %lu\n", address.c_str(), address.size());
+        }
+
+
+        if (command == "initiate") {
+            std::string data;
+            //std::cout << "Please enter the data\n";
+            std::cin >> data;
+
+            // sign the data.
+
+            std::string address;
+            std::string signature = get_secp256k1_signature(data, verifier_private_key, address);
+
+
+            // Call into the enclave
+
+            // Example.
+            // char* data = "a:1;b:2;c:3";
+            // size_t data_size = 11;
+            // char* signature = "aaaaa";
+            // size_t signature_size = 5;
+        
+            result = enclave_update_nft_status(enclave, data.c_str(), data.size(), signature.c_str(), signature.size());
+            if (result != OE_OK)
+            {
+                printf(
+                "Host: enclave_update_nft_status failed. %s",
+                oe_result_str(result));
+                if (ret == 0)
+                    ret = 1;
+                goto exit;
+            }
+        }
+
+        if (command == "mint") {
+            std::string message;
+            std::cin >> message;
+            std::string key;
+            std::cin >> key;
+            std::string token_uri;
+            std::cin >> token_uri;
+
+            std::string address;
+            struct timeval stop, start;
+            gettimeofday(&start, NULL);
+
+            std::string signature = get_secp256k1_signature(message, key, address);
+
+            gettimeofday(&stop, NULL);
+
+
+            std::cout << "Time taken by signing off-chn: " 
+                    << stop.tv_usec - start.tv_usec << " microseconds" << std::endl;
+
+            result = enclave_mint_nft(enclave, token_uri.c_str(), token_uri.size(), 
+                    signature.c_str(), signature.size(), address.c_str(), address.size());
+            if (result != OE_OK)
+            {
+                printf(
+                "Host: enclave_mint_nft failed. %s",
+                oe_result_str(result));
+                if (ret == 0)
+                    ret = 1;
+                goto exit;
+            }
+
+            gettimeofday(&stop, NULL);
+            std::cout << "Time taken by mint off-chn: " 
+                    << stop.tv_usec - start.tv_usec << " microseconds" << std::endl;
+        }
+
+        if (command == "list") {
+            std::string message;
+            std::cin >> message;
+            std::string key;
+            std::cin >> key;
+            int nft_id;
+            std::cin >> nft_id;
+            unsigned price;
+            std::cin >> price;
+            std::string buyer_address;
+            std::cin >> buyer_address;
+
+            struct timeval stop, start;
+            gettimeofday(&start, NULL);
+
+            std::string address;
+            std::string signature = get_secp256k1_signature(message, key, address);
+
+            gettimeofday(&stop, NULL);
+
+
+            std::cout << "Time taken by signing off-chn: " 
+                    << stop.tv_usec - start.tv_usec << " microseconds" << std::endl;
+
+            result = enclave_list_nft(enclave, signature.c_str(), signature.size(), 
+                address.c_str(), address.size(), nft_id, price, buyer_address.c_str(), buyer_address.size());
+            if (result != OE_OK)
+            {
+                printf(
+                "Host: enclave_list_nft failed. %s",
+                oe_result_str(result));
+                if (ret == 0)
+                    ret = 1;
+                goto exit;
+            }
+
+            gettimeofday(&stop, NULL);
+            std::cout << "Time taken by list off-chn: " 
+                    << stop.tv_usec - start.tv_usec << " microseconds" << std::endl;
+
+        }
+
+        if (command == "update_balance") {
+            std::string address;
+            std::cin >> address;
+            unsigned int balance;
+            std::cin >> balance;
+
+            // sign the data.
+            std::string data = "address:" + address + ",balance:" + std::to_string(balance) + ",seq_num:" + 
+                std::to_string(verifier_seq_num);
+
+            std::string _address;
+            std::string signature = get_secp256k1_signature(data, verifier_private_key, _address);
+
+            result = enclave_update_wallet_balances(enclave, signature.c_str(), signature.size(), 
+                                address.c_str(), address.size(), balance, verifier_seq_num);
+
+            verifier_seq_num++;
+            if (result != OE_OK)
+            {
+                printf(
+                "Host: enclave_update_wallet_balances failed. %s",
+                oe_result_str(result));
+                if (ret == 0)
+                    ret = 1;
+                goto exit;
+            }
+        }
+
+        if (command == "buy") {
+            std::string message;
+            std::cin >> message;
+            int nft_id;
+            std::cin >> nft_id;
+            std::string key;
+            std::cin >> key;
+
+            struct timeval stop, start;
+            gettimeofday(&start, NULL);
+
+            std::string address;
+            std::string signature = get_secp256k1_signature(message, key, address);
+
+            gettimeofday(&stop, NULL);
+            std::cout << "Time taken by signing off-chn: " 
+                    << stop.tv_usec - start.tv_usec << " microseconds" << std::endl;
+
+            result = enclave_buy_nft(enclave, signature.c_str(), signature.size(), address.c_str(), address.size(), nft_id);
+
+            gettimeofday(&stop, NULL);
+            std::cout << "Time taken by buy off-chn: " 
+                    << stop.tv_usec - start.tv_usec << " microseconds" << std::endl;
+
+            if (result != OE_OK)
+            {
+                printf(
+                "Host: enclave_list_nft failed. %s",
+                oe_result_str(result));
+                if (ret == 0)
+                    ret = 1;
+                goto exit;
+            }
+
+            
+
+        }
+
+        if (command == "update_txn_status") {
+            std::string tee_signature;
+            std::cin >> tee_signature;
+            int nft_id;
+            std::cin >> nft_id;
+            std::string status;
+            std::cin >> status;
+
+            std::string message = tee_signature + std::to_string(nft_id) + status;
+
+            // sign the data.
+
+            std::string address;
+            std::string signature = get_secp256k1_signature(message, verifier_private_key, address);
+
+            result = enclave_update_transaction_status(enclave, signature.c_str(), signature.size(), 
+                                                tee_signature.c_str(), tee_signature.size(),
+                                                nft_id, status.c_str(), status.size());
+            if (result != OE_OK)
+            {
+                printf(
+                "Host: enclave_update_transaction_status failed. %s",
+                oe_result_str(result));
+                if (ret == 0)
+                    ret = 1;
+                goto exit;
+            }
+
+        }
+
+        if (command == "print_nfts") {
+            print_nft_owership_data(enclave);
+        }
+
+        if (command == "print_wallets") {
+            print_proxy_wallet_balances(enclave);
+        }
+
+        if (command == "print_listings") {
+            print_listings(enclave);
+        }
+
+        if (command == "print_pending") {
+            print_pending(enclave);
+        }
+        
+    }
+
+    ret = 0;
+
+exit:
+    // Clean up the enclave if we created one
+
+    printf("Host: Terminating enclaves\n");
+
+    if (enclave)
+        oe_terminate_enclave(enclave);
+
+    
+    printf("Host:  %s \n", (ret == 0) ? "succeeded" : "failed");
+    return ret;
+}
