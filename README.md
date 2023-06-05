@@ -65,7 +65,10 @@ Make sure to uncomment the corresponding step in `interact.js`.
 We used the OpenSea SDK https://github.com/ProjectOpenSea/opensea-js to perform transaction time 
 evaluations. Note that this is rate limited. 
 
-@Vineeth -- Add scripts.
+`sell_nft.js` is used to List(Sell) an NFT on OpenSea. The NFT token needs to be in your account and you can set a price for it.
+`buy_nft.js` is used to Buy an NFT on OpenSea if you know the token ID of the NFT and have sufficient balance in your account.
+
+The ETH gets transferred between the buyer and seller when the order gets executed.
 
 ## Onchain NFT marketplace evaluations 
 Create Alchemy account in https://www.alchemy.com/homepage and generate API keys.
