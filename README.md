@@ -1,10 +1,10 @@
-# DecentEdge/LiftPlace
-LiftPlace implementation and evaluation modules
+# DecentEdge
+DecentEdge implementation and evaluation modules
 
 The complete evaluation data is present in `Evaluations.xlsx`
 
 ## Project Setup
-For the Liftplace off chain component, we need an SGX enabled machine.
+For the DecentEdge off chain component, we need an SGX enabled machine.
 
 Install the OpenEnclave SDK following the guide https://github.com/openenclave/openenclave/blob/master/docs/GettingStartedDocs/README.md
 and make sure that you are able to run a sample project from https://github.com/openenclave/openenclave/blob/master/samples/helloworld/README.md
@@ -12,7 +12,7 @@ and make sure that you are able to run a sample project from https://github.com/
 ### Additional setup
 Follow the required steps in `setup.sh`
 
-## Starting LiftPlace
+## Starting DecentEdge
 A CLI interface can be accessed as follows
 
 ```shell
@@ -100,7 +100,7 @@ for i in {1..21}; do node scripts/buy-sepolia.js $i; done
 ```
 
 
-## LiftPlace Evaluations
+## DecentEdge Evaluations
 Some sample test cases are provided in `nftm/testcases`
 
 Note that we have removed our private keys from these testcases which are required 
