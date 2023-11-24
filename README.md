@@ -1,4 +1,4 @@
-# LiftPlace
+# DecentEdge/LiftPlace
 LiftPlace implementation and evaluation modules
 
 The complete evaluation data is present in `Evaluations.xlsx`
